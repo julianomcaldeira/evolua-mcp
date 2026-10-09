@@ -49,6 +49,14 @@ const user = (id) => {
 };
 const ilike = (s) => (s ? `ilike.%${s}%` : undefined);
 const eq = (s) => (s ? `eq.${s}` : undefined);
+const norm = (s) => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+// A API não aceita filtros combinados (and/or): o limite superior do intervalo é aplicado aqui.
+async function rangeFilter(promise, field, both, ate, max) {
+  const r = await promise;
+  if (!both) return r;
+  const lim = new Date(ate).getTime();
+  return { data: (r.data || []).filter((x) => x[field] && new Date(x[field]).getTime() <= lim).slice(0, max) };
+}
 
 const TASK_TYPES = ["ligacao", "email", "whatsapp", "linkedin", "visita_presencial", "reuniao_online", "visita_feira", "visita_evento", "pesquisa_inicial"];
 
@@ -61,9 +69,10 @@ function buildServer() {
     inputSchema: { busca: z.string().optional().describe("Parte do nome ou e-mail") },
     annotations: ro,
   }, wrap(async ({ busca }) => {
-    const q = { select: "id,full_name,email", is_deleted: "eq.false", limit: 50, order: "full_name.asc" };
-    if (busca) q.or = `(full_name.ilike.%${busca}%,email.ilike.%${busca}%)`;
-    return api("GET", "/profiles", { query: q });
+    const r = await api("GET", "/profiles", { query: { select: "id,full_name,email", is_deleted: "eq.false", limit: 500, order: "full_name.asc" } });
+    if (!busca) return r;
+    const b = norm(busca);
+    return { data: (r.data || []).filter((p) => norm(p.full_name).includes(b) || norm(p.email).includes(b)) };
   }));
 
   s.registerTool("buscar_clientes", {
@@ -109,10 +118,10 @@ function buildServer() {
       assigned_to: eq(responsavel_id), client_id: eq(client_id), opportunity_id: eq(opportunity_id),
       status: eq(status), order: "due_date.asc", limit: limite || 50,
     };
-    if (vence_de && vence_ate) q.and = `(due_date.gte.${vence_de},due_date.lte.${vence_ate})`;
-    else if (vence_de) q.due_date = `gte.${vence_de}`;
+    if (vence_de) q.due_date = `gte.${vence_de}`;
     else if (vence_ate) q.due_date = `lte.${vence_ate}`;
-    return api("GET", "/tasks", { query: q });
+    if (vence_de && vence_ate) q.limit = 1000;
+    return rangeFilter(api("GET", "/tasks", { query: q }), "due_date", vence_de && vence_ate, vence_ate, limite || 50);
   }));
 
   s.registerTool("criar_tarefa", {
@@ -164,10 +173,10 @@ function buildServer() {
     annotations: ro,
   }, wrap(({ usuario_id, opportunity_id, de, ate }) => {
     const q = { pre_vendas_user_id: eq(usuario_id), opportunity_id: eq(opportunity_id), order: "start_datetime.asc", limit: 100 };
-    if (de && ate) q.and = `(start_datetime.gte.${de},start_datetime.lte.${ate})`;
-    else if (de) q.start_datetime = `gte.${de}`;
+    if (de) q.start_datetime = `gte.${de}`;
     else if (ate) q.start_datetime = `lte.${ate}`;
-    return api("GET", "/pre_vendas_agenda", { query: q });
+    if (de && ate) q.limit = 1000;
+    return rangeFilter(api("GET", "/pre_vendas_agenda", { query: q }), "start_datetime", de && ate, ate, 100);
   }));
 
   s.registerTool("criar_evento_agenda", {
