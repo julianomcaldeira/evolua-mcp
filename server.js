@@ -215,7 +215,53 @@ function buildServer() {
     location: a.local, description: a.descricao, attendees: a.participantes,
   }) })));
 
+  s.registerTool("oportunidades_paradas", {
+    description: "Lista oportunidades abertas (sem won/lost) que estão paradas: sem atividade registrada e sem tarefa criada ou concluída nos últimos N dias, e sem nenhuma tarefa pendente. Já traz o nome do cliente, o responsável e há quantos dias está parada.",
+    inputSchema: { dias: z.number().int().min(1).max(365).optional().describe("Dias sem movimento (padrão 14)") },
+    annotations: ro,
+  }, wrap(async ({ dias }) => {
+    const d = dias || 14;
+    const cutoff = Date.now() - d * 86400000;
+    const opps = await fetchAll("/opportunities", { status: "not.in.(won,lost)", select: "id,title,status,client_id,assigned_to,created_at,expected_close_date,probability" });
+    const acts = await fetchAll("/opportunity_activities", { select: "opportunity_id,created_at", order: "created_at.desc" }, 5000);
+    const tasks = await fetchAll("/tasks", { opportunity_id: "not.is.null", select: "opportunity_id,status,created_at,completed_at,due_date" }, 5000);
+    const last = {}, pendingFor = new Set();
+    const touch = (id, t) => { if (!id || !t) return; const v = new Date(t).getTime(); if (!last[id] || v > last[id]) last[id] = v; };
+    for (const a of acts) touch(a.opportunity_id, a.created_at);
+    for (const t of tasks) {
+      touch(t.opportunity_id, t.created_at); touch(t.opportunity_id, t.completed_at);
+      if (t.status === "pending" || t.status === "in_progress") pendingFor.add(t.opportunity_id);
+    }
+    const stale = opps.filter((o) => !pendingFor.has(o.id)).map((o) => {
+      const lt = last[o.id] || new Date(o.created_at).getTime();
+      return { ...o, ultimo_movimento: new Date(lt).toISOString(), dias_parada: Math.floor((Date.now() - lt) / 86400000) };
+    }).filter((o) => new Date(o.ultimo_movimento).getTime() < cutoff).sort((a, b) => b.dias_parada - a.dias_parada);
+    const ids = [...new Set(stale.map((o) => o.client_id).filter(Boolean))];
+    const names = {};
+    for (let i = 0; i < ids.length; i += 80) {
+      const r = await api("GET", "/clients", { query: { id: `in.(${ids.slice(i, i + 80).join(",")})`, select: "id,company_name,trade_name", limit: 100 } });
+      for (const c of r.data || []) names[c.id] = c.trade_name || c.company_name;
+    }
+    const people = {};
+    for (const p of (await api("GET", "/profiles", { query: { select: "id,full_name", limit: 500 } })).data || []) people[p.id] = p.full_name;
+    return {
+      dias: d, total_abertas: opps.length, total_paradas: stale.length,
+      data: stale.map((o) => ({ ...o, cliente: names[o.client_id] || null, responsavel: people[o.assigned_to] || null })),
+    };
+  }));
+
   return s;
+}
+
+async function fetchAll(path, query, max = 3000) {
+  const out = [];
+  for (let offset = 0; offset < max; offset += 1000) {
+    const r = await api("GET", path, { query: { ...query, limit: 1000, offset } });
+    const rows = r.data || [];
+    out.push(...rows);
+    if (rows.length < 1000) break;
+  }
+  return out;
 }
 
 const app = express();
